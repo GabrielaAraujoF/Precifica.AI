@@ -1,11 +1,9 @@
-
-
 # mensagem do usuário
 # extrair_dados_com_ia()        (LLM: SÓ converte texto em JSON)
 # normalizar_extracao()         (valida e corrige tipos vindos da LLM)
 # atualizar_estado()            (mescla com a sessão)
 # calcular_metricas_financeiras() / simular_novo_preco()   (matemática)
-# ormatar_explicacao_humana()  (texto final para o chat)
+# formatar_explicacao_humana()  (texto final para o chat)
 
 
 from __future__ import annotations
@@ -30,29 +28,26 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger("preco_justo.engine")
 
-# --------------------------------------------------------------------------- #
 # Configuração
-# --------------------------------------------------------------------------- #
 
 TAXA_PADRAO = 0.05  # 5% de taxa de maquininha quando o usuário não informa
 
-# Modelo configurável por variável de ambiente (ver observação no .env.example).
-MODELO_GEMINI = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-# Modelos reserva, tentados em ordem quando o principal está sobrecarregado (503/429)
-# ou indisponível (404). Separados por vírgula; vazio desativa o fallback.
+MODELO_GEMINI = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Modelos reserva, tentados em ordem quando o principal falha. Separados por vírgula.
 MODELOS_RESERVA = [
     m.strip()
-    for m in os.getenv("GEMINI_MODELOS_RESERVA", "gemini-flash-latest,gemini-3.5-flash-lite").split(",")
+    for m in os.getenv("GEMINI_MODELOS_RESERVA", "gemini-3.8-flash").split(",")
     if m.strip()
 ]
 TENTATIVAS_POR_MODELO = int(os.getenv("GEMINI_TENTATIVAS", "2"))
 ESPERA_INICIAL_SEGUNDOS = float(os.getenv("GEMINI_ESPERA", "1.5"))
-CODIGOS_TEMPORARIOS = {429, 500, 502, 503}  # sobrecarga: tentar de novo
-CODIGOS_TROCAR_MODELO = {404, 504}  # inexistente / lento demais: vai direto ao próximo
+CODIGOS_TEMPORARIOS = {500, 502, 503}  # sobrecarga momentânea: tentar de novo
+# 404 inexistente | 429 cota esgotada | 504 lento demais: vai direto ao próximo modelo
+CODIGOS_TROCAR_MODELO = {404, 429, 504}
 # Gemini 3+: o Google recomenda temperatura padrão (1.0); valores menores podem causar loops e respostas lentas.
 NIVEL_RACIOCINIO = os.getenv("GEMINI_THINKING", "low")  # minimal | low | medium | high
 TIMEOUT_LLM_SEGUNDOS = float(os.getenv("GEMINI_TIMEOUT", "15"))  # por chamada
-# Tempo máximo somando todas as tentativas e modelos reserva. Depois disso o usuário recebe a mensagem em vez de ficar esperando no chat.
+# Tempo máximo somando todas as tentativas. Depois disso o usuário recebe a mensagem amigável.
 PRAZO_TOTAL_SEGUNDOS = float(os.getenv("GEMINI_PRAZO_TOTAL", "25"))
 
 SYSTEM_PROMPT = """Você é o extrator de dados estruturados do "Preço Justo", um assistente de precificação para trabalhadores autônomos.
@@ -134,7 +129,7 @@ class ErroExtracao(Exception):
     """Falha ao obter/interpretar a resposta da LLM."""
 
 
-#conversão e normalização
+# Conversão e normalização
 
 _CENTAVO = Decimal("0.01")
 
@@ -265,7 +260,8 @@ def _extrair_json(texto: str) -> dict:
         raise ErroExtracao(f"JSON inválido retornado pela IA: {exc}") from exc
 
 
-#Integração com a LLM (Gemini)
+# Integração com a LLM (Gemini)
+
 _cache_clientes: dict = {}
 
 
@@ -277,7 +273,7 @@ def _obter_cliente():
     if chave in _cache_clientes:
         return _cache_clientes[chave]
     try:
-        from google import genai  #testes rodam sem o pacote
+        from google import genai  # import tardio: testes rodam sem o pacote
         from google.genai import types
     except ImportError as exc:
         raise ErroExtracao("Pacote 'google-genai' não instalado (pip install -r requirements.txt).") from exc
@@ -343,9 +339,9 @@ def extrair_dados_com_ia(mensagem: str, estado_atual: Optional[dict] = None) -> 
     Chama o Gemini e devolve o JSON já normalizado. Lança ErroExtracao em falhas.
 
     Resiliência:
-      - 503/429/5xx (sobrecarga): espera com backoff e tenta de novo; se persistir,
+      - 500/502/503 (sobrecarga): espera com backoff e tenta de novo; se persistir,
         passa para o próximo modelo de MODELOS_RESERVA.
-      - 404 (modelo inexistente) ou 504 (lento demais): pula direto para o próximo modelo.
+      - 404 (inexistente), 429 (cota esgotada) ou 504 (lento): pula direto ao próximo.
       - JSON inválido: tenta de novo no mesmo modelo.
       - 400/401/403 (chave ou requisição inválida): falha na hora, sem insistir.
     """
@@ -389,8 +385,7 @@ def extrair_dados_com_ia(mensagem: str, estado_atual: Optional[dict] = None) -> 
     raise ErroExtracao("Nenhum modelo respondeu. Tentativas: " + " | ".join(falhas))
 
 
-
-#financeiro determinístico (funções)
+# Motor financeiro determinístico
 
 def calcular_metricas_financeiras(
     materiais: list[dict],
@@ -687,7 +682,7 @@ def _texto_faltantes(faltantes: list[str], intencao: str) -> str:
     return f"{inicio} Para calcular seu preço justo, ainda preciso saber:\n{itens}"
 
 
-# Função principal (juntar com o front-end)
+# Função principal (integração com o front-end)
 
 def processar_mensagem_usuario(
     mensagem: str,
@@ -731,7 +726,7 @@ def processar_mensagem_usuario(
         resultado["erro"] = "mensagem_vazia"
         return resultado
 
-    #Extração (IA)
+    # Extração (IA)
     try:
         dados = normalizar_extracao((extrator or extrair_dados_com_ia)(mensagem, estado_base))
     except Exception as exc:
@@ -747,13 +742,11 @@ def processar_mensagem_usuario(
     resultado["intencao"] = intencao
     resultado["dados_extraidos"] = dados
 
-    #Estado
-    novo_estado = atualizar_estado(estado_base, dados)
-    resultado["estado"] = novo_estado
-    faltantes = campos_faltantes(novo_estado)
-
-    #Cálculo + resposta
+    # Estado + cálculo. O estado vem do navegador (não confiável):
+    # valor malformado vira resposta amigável em vez de erro 500.
     try:
+        novo_estado = atualizar_estado(estado_base, dados)
+        faltantes = campos_faltantes(novo_estado)
         if intencao == "simular_preco":
             novo_preco = dados.get("novo_preco_simulado")
             faltantes_sim = [c for c in faltantes if c != "preco_cobrado"]
@@ -776,7 +769,9 @@ def processar_mensagem_usuario(
                 resultado["resposta"] = formatar_explicacao_humana(
                     {**metricas, "nome_servico": novo_estado.get("nome_servico")}, intencao
                 )
-    except ValueError as exc:
+    except (ValueError, ArithmeticError, TypeError, KeyError, AttributeError) as exc:
+        logger.warning("Dados inválidos na sessão: %s", exc)
+        resultado["intencao"] = None
         resultado["erro"] = str(exc)
         resultado["resposta"] = (
             "Algum valor ficou estranho (negativo ou taxa acima de 100%). "
@@ -784,5 +779,6 @@ def processar_mensagem_usuario(
         )
         return resultado
 
+    resultado["estado"] = novo_estado
     resultado["sucesso"] = True
     return resultado
