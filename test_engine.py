@@ -1,5 +1,6 @@
 """
-Código de teste do motor financeiro e do fluxo de estado.
+test_engine.py — Testes do módulo Preço Justo.
+
 Rodar:  python -m unittest -v test_engine.py      (ou: pytest -v)
 
 Os testes principais NÃO dependem da API: a extração é substituída por um
@@ -65,8 +66,9 @@ class FakeExtrator:
         return copy.deepcopy(self.saida)
 
 
-
+# --------------------------------------------------------------------------- #
 # Cenários obrigatórios
+# --------------------------------------------------------------------------- #
 
 class TestCenario1ManicureInicio(unittest.TestCase):
     MENSAGEM = (
@@ -206,7 +208,10 @@ class TestCenario3ArtesanatoSimulacao(unittest.TestCase):
         self.assertIn("antes R$ 17,00", self.r["resposta"])
 
 
-# Motor financeiro (funções)
+# --------------------------------------------------------------------------- #
+# Motor financeiro (funções puras)
+# --------------------------------------------------------------------------- #
+
 class TestMotorFinanceiro(unittest.TestCase):
     def test_exemplo_maquiagem_do_briefing(self):
         m = calcular_metricas_financeiras(
@@ -265,7 +270,10 @@ class TestMotorFinanceiro(unittest.TestCase):
         self.assertEqual(s["sobra_simulada"], 37.50)
 
 
+# --------------------------------------------------------------------------- #
 # Normalização da saída da LLM e mescla de estado
+# --------------------------------------------------------------------------- #
+
 class TestNormalizacao(unittest.TestCase):
     def test_numeros_em_formato_brasileiro(self):
         self.assertEqual(para_float("R$ 1.234,56"), 1234.56)
@@ -329,7 +337,9 @@ class TestAtualizarEstado(unittest.TestCase):
         self.assertEqual(e["preco_cobrado"], 60.0)
 
 
+# --------------------------------------------------------------------------- #
 # Robustez do contrato com o front-end
+
 class TestRobustez(unittest.TestCase):
     CHAVES = {"sucesso", "intencao", "dados_extraidos", "estado", "metricas",
               "simulacao", "informacoes_faltantes", "resposta", "erro"}
@@ -341,6 +351,20 @@ class TestRobustez(unittest.TestCase):
         self.assertFalse(r["sucesso"])
         self.assertEqual(r["estado"]["preco_cobrado"], 60.0)
         self.assertTrue(r["resposta"])
+
+    def test_estado_malformado_do_navegador_nao_gera_erro_500(self):
+        ruins = [
+            {"preco_cobrado": 60, "tempo_horas": "abc", "valor_hora_desejado": 10},
+            {"preco_cobrado": 60, "tempo_horas": 1, "valor_hora_desejado": 10, "materiais": "tecido"},
+            {"preco_cobrado": 60, "tempo_horas": 1, "valor_hora_desejado": 10, "materiais": [{"item": "x", "valor": "abc"}]},
+        ]
+        for estado in ruins:
+            r = processar_mensagem_usuario("Cobro 60", estado,
+                                           extrator=FakeExtrator(resposta_llm(preco_cobrado=60)))
+            self.assertEqual(set(r), self.CHAVES)
+            self.assertFalse(r["sucesso"])
+            self.assertEqual(r["estado"], estado)  # devolve o estado recebido, sem mexer
+            self.assertTrue(r["resposta"])
 
     def test_mensagem_vazia(self):
         extrator = FakeExtrator(resposta_llm())
@@ -381,7 +405,10 @@ class TestRobustez(unittest.TestCase):
         self.assertEqual(engine._montar_conteudo("oi", None), "oi")
 
 
+# --------------------------------------------------------------------------- #
 # Resiliência da chamada à IA (cliente Gemini simulado, sem rede)
+# --------------------------------------------------------------------------- #
+
 class ErroAPIFalso(Exception):
     def __init__(self, code):
         super().__init__(f"HTTP {code}")
@@ -434,6 +461,11 @@ class TestResilienciaGemini(unittest.TestCase):
         r, c = self.rodar([ErroAPIFalso(404), self.JSON_OK])
         self.assertEqual(c.modelos_chamados, ["principal", "reserva"])
 
+    def test_429_cota_esgotada_pula_direto_para_reserva(self):
+        r, c = self.rodar([ErroAPIFalso(429), self.JSON_OK])
+        self.assertEqual(r["intencao"], "simular_preco")
+        self.assertEqual(c.modelos_chamados, ["principal", "reserva"])
+
     def test_504_pula_direto_para_reserva(self):
         r, c = self.rodar([ErroAPIFalso(504), self.JSON_OK])
         self.assertEqual(r["intencao"], "simular_preco")
@@ -463,6 +495,171 @@ class TestResilienciaGemini(unittest.TestCase):
         self.assertIn("Nenhum modelo respondeu", str(r))
 
 
+# --------------------------------------------------------------------------- #
+# Modelo recorrente (assinaturas, mensalidades, aulas...)
+# --------------------------------------------------------------------------- #
+
+class TestCenarioRecorrenteAssinatura(unittest.TestCase):
+    MENSAGEM = (
+        "Tenho um produto digital que funciona por assinatura, tenho 12 assinantes que pagam R$150 por mês, "
+        "meus custos são 370 anuais de domínio, 120 mensais de assinaturas de agentes de ia, 400 com "
+        "desenvolvimento, e passo cerca de 3 horas por dia trabalhando para este produto. Quero ganhar "
+        "R$5000 por mês, quanto devo cobrar"
+    )
+    SAIDA_LLM = resposta_llm(
+        modelo_cobranca="recorrente",
+        nome_servico="Produto digital por assinatura",
+        preco_cobrado=150.0,
+        periodicidade_preco="mensal",
+        quantidade_clientes=12.0,
+        custos_fixos=[
+            {"item": "Domínio", "valor": 370.0, "periodicidade": "anual", "por_cliente": False},
+            {"item": "Assinaturas de agentes de IA", "valor": 120.0, "periodicidade": "mensal", "por_cliente": False},
+            {"item": "Desenvolvimento", "valor": 400.0, "periodicidade": None, "por_cliente": False},
+        ],
+        horas_trabalhadas=3.0,
+        periodicidade_horas="diario",
+        renda_desejada=5000.0,
+        periodicidade_renda="mensal",
+    )
+
+    def setUp(self):
+        self.r = processar_mensagem_usuario(self.MENSAGEM, extrator=FakeExtrator(self.SAIDA_LLM))
+        self.m = self.r["metricas"]
+
+    def test_contrato_de_saida_inalterado(self):
+        self.assertEqual(set(self.r), TestRobustez.CHAVES)
+        self.assertTrue(self.r["sucesso"])
+        self.assertEqual(self.r["estado"]["modelo_cobranca"], "recorrente")
+        self.assertEqual(self.m["modelo_cobranca"], "recorrente")
+
+    def test_custos_convertidos_para_mes(self):
+        self.assertEqual(self.m["custos_fixos"][0]["valor_mensal"], 30.83)  # 370 / 12
+        self.assertEqual(self.m["custos_fixos_mensais"], 550.83)            # 30,83 + 120 + 400
+        self.assertEqual(self.m["custo_total"], 5550.83)                    # + renda de 5.000
+
+    def test_horas_e_valor_hora_implicito(self):
+        self.assertEqual(self.m["horas_mensais"], 66.0)          # 3h x 22 dias
+        self.assertEqual(self.m["valor_hora_implicito"], 75.76)  # 5000 / 66
+
+    def test_situacao_atual_e_preco_recomendado(self):
+        self.assertEqual(self.m["receita_bruta"], 1800.00)
+        self.assertEqual(self.m["valor_liquido"], 1710.00)
+        self.assertEqual(self.m["sobra_liquida"], -3840.83)
+        self.assertFalse(self.m["cobre_custos"])
+        self.assertEqual(self.m["preco_minimo"], 486.92)        # 5550,83 / (12 x 0,95)
+        self.assertEqual(self.m["clientes_necessarios"], 39)    # 5550,83 / 142,50
+
+    def test_premissas_explicitadas(self):
+        self.assertIn('"Desenvolvimento" como gasto mensal', self.r["resposta"])
+        self.assertIn("22 dias de trabalho por mês", self.r["resposta"])
+        self.assertIn("R$ 486,92 por mês por cliente", self.r["resposta"])
+        self.assertIn("**39 clientes**", self.r["resposta"])
+
+    def test_simular_novo_preco(self):
+        r = processar_mensagem_usuario("E se eu cobrar 500?", self.r["estado"], extrator=FakeExtrator(
+            resposta_llm(intencao="simular_preco", novo_preco_simulado=500)))
+        s = r["simulacao"]
+        self.assertEqual(s["sobra_original"], -3840.83)
+        self.assertEqual(s["sobra_simulada"], 149.17)
+        self.assertEqual(s["diferenca_sobra"], 3990.00)
+        self.assertEqual(r["estado"]["preco_cobrado"], 150.0)  # sessão preservada
+
+    def test_simular_mais_clientes(self):
+        r = processar_mensagem_usuario("E se eu tiver 40 assinantes?", self.r["estado"], extrator=FakeExtrator(
+            resposta_llm(intencao="simular_preco", novo_quantidade_clientes=40)))
+        s = r["simulacao"]
+        self.assertEqual(s["clientes_simulado"], 40.0)
+        self.assertEqual(s["metricas_simuladas"]["preco_minimo"], 146.07)
+        self.assertEqual(r["estado"]["quantidade_clientes"], 12.0)
+        self.assertIn("com 12: R$ 486,92", r["resposta"])
+
+    def test_corrigir_custo_para_gasto_unico(self):
+        r = processar_mensagem_usuario("O desenvolvimento foi um gasto único", self.r["estado"],
+                                       extrator=FakeExtrator(resposta_llm(
+                                           intencao="corrigir_dado",
+                                           custos_fixos=[{"item": "desenvolvimento", "valor": 400, "periodicidade": "unico"}])))
+        self.assertEqual(len(r["estado"]["custos_fixos"]), 3)
+        self.assertEqual(r["metricas"]["custos_fixos_mensais"], 184.17)  # 30,83 + 120 + 33,33
+        self.assertIn("dividido em 12 meses", r["resposta"])
+
+    def test_preco_anual(self):
+        r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(
+            modelo_cobranca="recorrente", quantidade_clientes=10, preco_cobrado=1200,
+            periodicidade_preco="anual", renda_desejada=2000, periodicidade_renda="mensal")))
+        m = r["metricas"]
+        self.assertEqual(m["receita_bruta"], 1000.00)          # 10 x 1200 / 12
+        self.assertEqual(m["preco_minimo"], 210.53)            # por mês
+        self.assertEqual(m["preco_minimo_periodo"], 2526.32)   # por ano
+        self.assertIn("R$ 2.526,32 por ano", r["resposta"])
+
+    def test_sem_preco_calcula_so_recomendacao(self):
+        r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(
+            modelo_cobranca="recorrente", quantidade_clientes=20, renda_desejada=3000,
+            periodicidade_renda="mensal",
+            custos_fixos=[{"item": "Servidor", "valor": 5, "periodicidade": "mensal", "por_cliente": True}])))
+        m = r["metricas"]
+        self.assertIsNone(m["sobra_liquida"])
+        self.assertEqual(m["custo_total"], 3100.00)   # 5 x 20 + 3000
+        self.assertEqual(m["preco_minimo"], 163.16)   # 3100 / (20 x 0,95)
+
+    def test_renda_por_horas_e_valor_hora(self):
+        r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(
+            modelo_cobranca="recorrente", quantidade_clientes=8, horas_trabalhadas=20,
+            periodicidade_horas="semanal", valor_hora_desejado=50)))
+        self.assertEqual(r["metricas"]["origem_renda"], "horas_x_valor_hora")
+        self.assertEqual(r["metricas"]["renda_desejada_mensal"], 4333.33)  # 20h x 52/12 x 50
+
+    def test_pede_o_que_falta_no_recorrente(self):
+        r = processar_mensagem_usuario("Tenho alunos de inglês", extrator=FakeExtrator(resposta_llm(
+            modelo_cobranca="recorrente", preco_cobrado=300, periodicidade_preco="mensal")))
+        self.assertEqual(r["informacoes_faltantes"], ["quantidade_clientes", "renda_desejada"])
+        self.assertIn("quantos clientes ou assinantes", r["resposta"])
+
+    def test_modelo_inferido_sem_classificacao_da_ia(self):
+        d = normalizar_extracao(resposta_llm(quantidade_clientes=5))
+        self.assertEqual(d["modelo_cobranca"], "recorrente")
+        self.assertIsNone(normalizar_extracao(resposta_llm(preco_cobrado=50))["modelo_cobranca"])
+
+    def test_normalizacao_de_periodos(self):
+        d = normalizar_extracao(resposta_llm(
+            periodicidade_preco="por mês", periodicidade_horas="Diário",
+            custos_fixos=[{"item": "a", "valor": "1.200,00", "periodicidade": "ao ano"},
+                          {"item": "b", "valor": 10, "periodicidade": "uma vez"},
+                          {"item": "c", "valor": 10, "periodicidade": "???"}]))
+        self.assertEqual(d["periodicidade_preco"], "mensal")
+        self.assertEqual(d["periodicidade_horas"], "diario")
+        self.assertEqual([c["periodicidade"] for c in d["custos_fixos"]], ["anual", "unico", None])
+        self.assertEqual(d["custos_fixos"][0]["valor"], 1200.0)
+
+    def test_sessao_por_servico_nao_vira_recorrente_por_engano(self):
+        estado = {"modelo_cobranca": "recorrente", "quantidade_clientes": 3, "renda_desejada": 900}
+        e = atualizar_estado(estado, normalizar_extracao(resposta_llm(modelo_cobranca="por_servico")))
+        self.assertEqual(e["modelo_cobranca"], "recorrente")  # não volta sozinho
+
+
+class TestPorServicoComCustosFixos(unittest.TestCase):
+    BASE = dict(nome_servico="Unha em gel", preco_cobrado=60, tempo_horas=2, valor_hora_desejado=15,
+                materiais=[{"item": "gel", "valor": 15}], deslocamento=5,
+                custos_fixos=[{"item": "Aluguel do salão", "valor": 800, "periodicidade": "mensal"}])
+
+    def test_custos_fixos_rateados_por_atendimento(self):
+        r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(**self.BASE, atendimentos_por_mes=40)))
+        m = r["metricas"]
+        self.assertEqual(m["modelo_cobranca"], "por_servico")
+        self.assertEqual(m["custo_direto"], 20.00)           # fórmula original intacta
+        self.assertEqual(m["custos_fixos_rateados"], 20.00)  # 800 / 40
+        self.assertEqual(m["custo_total"], 70.00)
+        self.assertEqual(m["sobra_liquida"], -13.00)
+        self.assertIn("R$ 800,00/mês ÷ 40 atendimentos", r["resposta"])
+
+    def test_custos_fixos_sem_atendimentos_avisa(self):
+        r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(**self.BASE)))
+        self.assertEqual(r["metricas"]["custo_total"], 50.00)  # não inventa rateio
+        self.assertIn("quantos atendimentos você faz por mês", r["resposta"])
+
+
+
 # Integração real com o Gemini
 
 @unittest.skipUnless(os.getenv("GEMINI_API_KEY") and os.getenv("RUN_INTEGRATION") == "1",
@@ -490,6 +687,17 @@ class TestIntegracaoGemini(unittest.TestCase):
         self.assertTrue(r["sucesso"], r["erro"])  # mostra o motivo se a API falhar
         self.assertEqual(r["intencao"], "simular_preco")
         self.assertEqual(r["simulacao"]["diferenca_sobra"], 28.50)
+
+    def test_recorrente_real(self):
+        r = processar_mensagem_usuario(TestCenarioRecorrenteAssinatura.MENSAGEM)
+        self.assertTrue(r["sucesso"], r["erro"])
+        self.assertEqual(r["estado"]["modelo_cobranca"], "recorrente")
+        m = r["metricas"]
+        self.assertEqual(m["quantidade_clientes"], 12.0)
+        self.assertEqual(m["renda_desejada_mensal"], 5000.00)
+        self.assertEqual(m["horas_mensais"], 66.0)
+        self.assertEqual(m["preco_cobrado"], 150.00)
+        self.assertEqual(len(m["custos_fixos"]), 3)
 
 
 if __name__ == "__main__":

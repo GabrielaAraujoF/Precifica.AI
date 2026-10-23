@@ -4,6 +4,10 @@
 # atualizar_estado()            (mescla com a sessão)
 # calcular_metricas_financeiras() / simular_novo_preco()   (matemática)
 # formatar_explicacao_humana()  (texto final para o chat)
+#
+# Dois modelos de cobrança:
+#   por_servico: preço por atendimento/peça (manicure, costura, artesanato...)
+#   recorrente:  preço por período (assinatura, mensalidade, hospedagem, aulas...)
 
 
 from __future__ import annotations
@@ -50,6 +54,28 @@ TIMEOUT_LLM_SEGUNDOS = float(os.getenv("GEMINI_TIMEOUT", "15"))  # por chamada
 # Tempo máximo somando todas as tentativas. Depois disso o usuário recebe a mensagem amigável.
 PRAZO_TOTAL_SEGUNDOS = float(os.getenv("GEMINI_PRAZO_TOTAL", "25"))
 
+# Conversão de períodos: tudo vira base MENSAL antes das contas
+DIAS_TRABALHO_MES = int(os.getenv("DIAS_TRABALHO_MES", "22"))  # para "horas por dia"
+DIAS_MES = 30  # para custos diários
+MESES_AMORTIZACAO = 12  # gasto único é diluído em 12 meses
+PERIODOS = ("diario", "semanal", "mensal", "trimestral", "semestral", "anual", "unico")
+FATOR_MENSAL = {
+    "diario": Decimal(DIAS_MES),
+    "semanal": Decimal(52) / Decimal(12),
+    "mensal": Decimal(1),
+    "trimestral": Decimal(1) / Decimal(3),
+    "semestral": Decimal(1) / Decimal(6),
+    "anual": Decimal(1) / Decimal(12),
+    "unico": Decimal(1) / Decimal(MESES_AMORTIZACAO),
+}
+# Horas e renda "por dia" contam só dias de trabalho
+FATOR_TRABALHO = {**FATOR_MENSAL, "diario": Decimal(DIAS_TRABALHO_MES)}
+NOME_PERIODO = {
+    "diario": "por dia", "semanal": "por semana", "mensal": "por mês",
+    "trimestral": "por trimestre", "semestral": "por semestre", "anual": "por ano",
+    "unico": "gasto único",
+}
+
 SYSTEM_PROMPT = """Você é o extrator de dados estruturados do "Preço Justo", um assistente de precificação para trabalhadores autônomos.
 Sua ÚNICA função é converter a mensagem em linguagem natural do usuário em um JSON estruturado.
 NUNCA faça cálculos matemáticos ou adicione explicações fora do JSON.
@@ -75,7 +101,19 @@ NUNCA faça cálculos matemáticos ou adicione explicações fora do JSON.
   "outros_gastos": float ou null,
   "taxa_maquininha_pct": float ou null,
   "campo_corrigido": string ou null,
-  "informacoes_faltantes": [strings]
+  "informacoes_faltantes": [strings],
+  "modelo_cobranca": "por_servico" | "recorrente" | null,
+  "periodicidade_preco": "semanal" | "mensal" | "trimestral" | "semestral" | "anual" | null,
+  "quantidade_clientes": float ou null,
+  "novo_quantidade_clientes": float ou null,
+  "atendimentos_por_mes": float ou null,
+  "custos_fixos": [
+    {"item": string, "valor": float, "periodicidade": "diario" | "semanal" | "mensal" | "trimestral" | "semestral" | "anual" | "unico" | null, "por_cliente": boolean}
+  ],
+  "horas_trabalhadas": float ou null,
+  "periodicidade_horas": "diario" | "semanal" | "mensal" | null,
+  "renda_desejada": float ou null,
+  "periodicidade_renda": "semanal" | "mensal" | "anual" | null
 }
 
 ### Regras de Conversão:
@@ -88,6 +126,14 @@ NUNCA faça cálculos matemáticos ou adicione explicações fora do JSON.
 7. Em "corrigir_dado", preencha SOMENTE o que foi corrigido. Se for um material, coloque o item em "materiais" com o novo valor, usando o mesmo nome do item que aparece no ESTADO ATUAL, e use "campo_corrigido": "materiais". Para outros campos, use o nome do campo (ex: "tempo_horas").
 8. Em "simular_preco", se o usuário citar o preço atual (ex: "em vez de R$ 60"), coloque esse valor em "preco_cobrado".
 9. O ESTADO ATUAL enviado junto é só contexto: não repita dados dele que o usuário não mencionou nesta mensagem.
+
+### Modelo de cobrança:
+10. "recorrente": o cliente paga por período (assinatura, mensalidade, plano, hospedagem, aulas mensais, contrato). "por_servico": cobra por atendimento, peça ou trabalho feito. Se não der para saber, null.
+11. Em "recorrente": o preço que cada cliente paga vai em "preco_cobrado" com "periodicidade_preco"; o número de assinantes/alunos/clientes vai em "quantidade_clientes"; o tempo de trabalho vai em "horas_trabalhadas" + "periodicidade_horas" (ex: "3 horas por dia" -> 3.0 e "diario"); a meta de ganho vai em "renda_desejada" + "periodicidade_renda" (ex: "quero ganhar R$ 5000 por mês" -> 5000.0 e "mensal"). Nesse modelo NÃO use "tempo_horas"; use "valor_hora_desejado" só se o usuário falar em valor por hora.
+12. Custos de estrutura (aluguel, domínio, servidor, softwares, ferramentas, internet, desenvolvimento, marketing) vão em "custos_fixos", com a periodicidade que o usuário disse. Se ele não disser o período, use null (não invente). Custo que existe para cada cliente (ex: "R$ 10 de servidor por aluno") tem "por_cliente": true.
+13. Em "por_servico", o que é gasto em cada serviço continua em "materiais"; custos mensais da estrutura (ex: aluguel do salão) vão em "custos_fixos"; "atendo 40 clientes por mês" -> "atendimentos_por_mes": 40.0.
+14. "E se eu tiver 20 assinantes?" -> "simular_preco" com "novo_quantidade_clientes": 20.0.
+15. Se não houver custos fixos, retorne "custos_fixos": [].
 """
 
 INTENCOES_VALIDAS = ("informar_dados", "corrigir_dado", "simular_preco")
@@ -100,8 +146,15 @@ CAMPOS_NUMERICOS = (
     "deslocamento",
     "outros_gastos",
     "taxa_maquininha_pct",
+    "quantidade_clientes",
+    "novo_quantidade_clientes",
+    "atendimentos_por_mes",
+    "horas_trabalhadas",
+    "renda_desejada",
 )
 CAMPOS_TEXTO = ("categoria_servico", "nome_servico", "campo_corrigido")
+CAMPOS_PERIODO = ("periodicidade_preco", "periodicidade_horas", "periodicidade_renda")
+MODELOS_COBRANCA = ("por_servico", "recorrente")
 
 # Campos que ficam guardados na sessão (o "estado").
 ESTADO_VAZIO: dict = {
@@ -114,6 +167,15 @@ ESTADO_VAZIO: dict = {
     "deslocamento": None,
     "outros_gastos": None,
     "taxa_maquininha_pct": None,
+    "modelo_cobranca": None,
+    "periodicidade_preco": None,
+    "quantidade_clientes": None,
+    "atendimentos_por_mes": None,
+    "custos_fixos": [],
+    "horas_trabalhadas": None,
+    "periodicidade_horas": None,
+    "renda_desejada": None,
+    "periodicidade_renda": None,
 }
 
 # Sem estes três não dá para calcular. Materiais/deslocamento/outros assumem 0
@@ -122,6 +184,12 @@ CAMPOS_OBRIGATORIOS = {
     "preco_cobrado": "quanto você cobra pelo serviço (ex: 'cobro R$ 80')",
     "tempo_horas": "quanto tempo leva para fazer (ex: 'demoro 2 horas')",
     "valor_hora_desejado": "quanto quer ganhar por hora de trabalho (ex: 'quero R$ 20 por hora')",
+}
+# Obrigatórios no modelo recorrente: clientes + meta de ganho (renda ou horas × valor/hora)
+DESCRICOES_FALTANTES = {
+    **CAMPOS_OBRIGATORIOS,
+    "quantidade_clientes": "quantos clientes ou assinantes você tem (ex: 'tenho 12 assinantes')",
+    "renda_desejada": "quanto quer ganhar com isso por mês (ex: 'quero ganhar R$ 5.000 por mês')",
 }
 
 
@@ -195,6 +263,26 @@ def _normalizar_taxa(valor: Any) -> Optional[float]:
     return taxa if 0 <= taxa < 1 else None
 
 
+def _normalizar_periodo(valor: Any) -> Optional[str]:
+    """'Mensal', 'por mês', 'ano'... -> chave de PERIODOS (None se não reconhecer)."""
+    if not isinstance(valor, str) or not valor.strip():
+        return None
+    texto = _chave(valor)
+    sinonimos = (
+        ("unico", ("unic", "uma vez", "pontual", "avulso")),
+        ("trimestral", ("trimest",)),
+        ("semestral", ("semest",)),
+        ("semanal", ("seman",)),
+        ("diario", ("diari", "dia")),
+        ("mensal", ("mensal", "mes", "month")),
+        ("anual", ("anual", "ano", "year")),
+    )
+    for chave, termos in sinonimos:
+        if any(t in texto for t in termos):
+            return chave
+    return None
+
+
 def _chave(texto: str) -> str:
     """Normaliza nomes para comparação: sem acento, minúsculo, espaços simples."""
     sem_acento = unicodedata.normalize("NFKD", str(texto))
@@ -232,14 +320,46 @@ def normalizar_extracao(bruto: Any) -> dict:
             materiais.append({"item": item.strip(), "valor": valor})
     dados["materiais"] = materiais
 
+    for campo in CAMPOS_PERIODO:
+        dados[campo] = _normalizar_periodo(bruto.get(campo))
+    if dados["periodicidade_preco"] == "unico":
+        dados["periodicidade_preco"] = None
+
+    custos_fixos = []
+    for c in bruto.get("custos_fixos") or []:
+        if not isinstance(c, dict):
+            continue
+        item = c.get("item")
+        valor = para_float(c.get("valor"))
+        if isinstance(item, str) and item.strip() and valor is not None:
+            custos_fixos.append({
+                "item": item.strip(),
+                "valor": valor,
+                "periodicidade": _normalizar_periodo(c.get("periodicidade")),
+                "por_cliente": c.get("por_cliente") is True,
+            })
+    dados["custos_fixos"] = custos_fixos
+
+    for campo in ("quantidade_clientes", "novo_quantidade_clientes", "atendimentos_por_mes"):
+        if dados[campo] is not None and dados[campo] <= 0:
+            dados[campo] = None
+
+    modelo = bruto.get("modelo_cobranca")
+    if modelo not in MODELOS_COBRANCA:
+        # Sinais fortes de cobrança recorrente quando a IA não classificou
+        sinais = (dados["quantidade_clientes"], dados["novo_quantidade_clientes"], dados["periodicidade_preco"])
+        modelo = "recorrente" if any(v is not None for v in sinais) else None
+    dados["modelo_cobranca"] = modelo
+
     faltantes = bruto.get("informacoes_faltantes") or []
     dados["informacoes_faltantes"] = [str(f) for f in faltantes if f] if isinstance(faltantes, list) else []
 
     intencao = bruto.get("intencao")
+    simulando = dados["novo_preco_simulado"] is not None or dados["novo_quantidade_clientes"] is not None
     if intencao not in INTENCOES_VALIDAS:
-        intencao = "simular_preco" if dados["novo_preco_simulado"] is not None else "informar_dados"
+        intencao = "simular_preco" if simulando else "informar_dados"
     # Proteção: LLM marcou simulação mas colocou o valor no campo errado.
-    if intencao == "simular_preco" and dados["novo_preco_simulado"] is None and dados["preco_cobrado"] is not None:
+    if intencao == "simular_preco" and not simulando and dados["preco_cobrado"] is not None:
         dados["novo_preco_simulado"] = dados["preco_cobrado"]
         dados["preco_cobrado"] = None
     dados["intencao"] = intencao
@@ -395,13 +515,15 @@ def calcular_metricas_financeiras(
     valor_hora_desejado: float,
     preco_cobrado: float,
     taxa_maquininha_pct: float = TAXA_PADRAO,
+    custos_fixos_rateados: float = 0,
 ) -> dict:
     """
-    Calcula todos os custos, sobra real, margem e preço mínimo recomendável.
+    Calcula todos os custos, sobra real, margem e preço mínimo recomendável (por serviço).
 
         C_d   = soma(materiais) + deslocamento + outros_gastos
         C_mo  = tempo_horas * valor_hora_desejado
-        C_t   = C_d + C_mo
+        C_f   = custos fixos mensais / atendimentos por mês (0 se não informado)
+        C_t   = C_d + C_mo + C_f
         V_l   = preco_cobrado * (1 - taxa)
         S     = V_l - C_t
         Marg% = (S / preco_cobrado) * 100        (None se preço = 0)
@@ -420,6 +542,7 @@ def calcular_metricas_financeiras(
         "tempo_horas": _dec(tempo_horas),
         "valor_hora_desejado": _dec(valor_hora_desejado),
         "preco_cobrado": _dec(preco_cobrado),
+        "custos_fixos_rateados": _dec(custos_fixos_rateados),
     }
     valores_materiais = [_dec(m.get("valor")) for m in (materiais or [])]
     if any(v < 0 for v in list(entradas.values()) + valores_materiais):
@@ -428,7 +551,7 @@ def calcular_metricas_financeiras(
     total_materiais = sum(valores_materiais, Decimal("0"))
     custo_direto = total_materiais + entradas["deslocamento"] + entradas["outros_gastos"]
     custo_mao_obra = entradas["tempo_horas"] * entradas["valor_hora_desejado"]
-    custo_total = custo_direto + custo_mao_obra
+    custo_total = custo_direto + custo_mao_obra + entradas["custos_fixos_rateados"]
 
     preco = entradas["preco_cobrado"]
     valor_taxa = preco * taxa
@@ -438,6 +561,7 @@ def calcular_metricas_financeiras(
     preco_minimo = custo_total / (1 - taxa)
 
     return {
+        "modelo_cobranca": "por_servico",
         "total_materiais": _arred(total_materiais),
         "deslocamento": _arred(entradas["deslocamento"]),
         "outros_gastos": _arred(entradas["outros_gastos"]),
@@ -445,6 +569,7 @@ def calcular_metricas_financeiras(
         "tempo_horas": float(entradas["tempo_horas"]),
         "valor_hora_desejado": _arred(entradas["valor_hora_desejado"]),
         "custo_mao_obra": _arred(custo_mao_obra),
+        "custos_fixos_rateados": _arred(entradas["custos_fixos_rateados"]),
         "custo_total": _arred(custo_total),
         "preco_cobrado": _arred(preco),
         "taxa_maquininha_pct": float(taxa),
@@ -457,40 +582,233 @@ def calcular_metricas_financeiras(
     }
 
 
-def _metricas_do_estado(estado: dict, preco: Optional[float] = None) -> dict:
-    """Atalho: calcula as métricas a partir de um estado de sessão."""
-    return calcular_metricas_financeiras(
+def _modo(estado: dict) -> str:
+    return "recorrente" if estado.get("modelo_cobranca") == "recorrente" else "por_servico"
+
+
+def _custos_fixos_mensais(custos_fixos: list[dict]) -> list[dict]:
+    """Converte cada custo fixo para base mensal. Sem período informado = mensal (premissa)."""
+    itens = []
+    for c in custos_fixos or []:
+        periodo = c.get("periodicidade")
+        fator = FATOR_MENSAL.get(periodo or "mensal")
+        valor = _dec(c.get("valor"))
+        if valor < 0:
+            raise ValueError("Valores não podem ser negativos.")
+        itens.append({
+            "item": c["item"],
+            "valor": valor,
+            "periodicidade": periodo,
+            "por_cliente": bool(c.get("por_cliente")),
+            "valor_mensal": valor * fator,
+        })
+    return itens
+
+
+def _metricas_do_estado(estado: dict, preco: Optional[float] = None, clientes: Optional[float] = None) -> dict:
+    """Atalho: calcula as métricas a partir de um estado de sessão, conforme o modelo de cobrança."""
+    preco_usado = estado.get("preco_cobrado") if preco is None else preco
+    if _modo(estado) == "recorrente":
+        return calcular_metricas_recorrentes(
+            custos_fixos=estado.get("custos_fixos") or [],
+            quantidade_clientes=estado.get("quantidade_clientes") if clientes is None else clientes,
+            renda_desejada=estado.get("renda_desejada"),
+            periodicidade_renda=estado.get("periodicidade_renda"),
+            horas_trabalhadas=estado.get("horas_trabalhadas"),
+            periodicidade_horas=estado.get("periodicidade_horas"),
+            valor_hora_desejado=estado.get("valor_hora_desejado"),
+            preco_cobrado=preco_usado,
+            periodicidade_preco=estado.get("periodicidade_preco"),
+            taxa_maquininha_pct=estado.get("taxa_maquininha_pct"),
+        )
+
+    fixos = _custos_fixos_mensais(estado.get("custos_fixos") or [])
+    atendimentos = estado.get("atendimentos_por_mes")
+    rateio = Decimal("0")
+    if fixos and atendimentos:
+        rateio = sum((c["valor_mensal"] for c in fixos), Decimal("0")) / _dec(atendimentos)
+    metricas = calcular_metricas_financeiras(
         materiais=estado.get("materiais") or [],
         deslocamento=estado.get("deslocamento"),
         outros_gastos=estado.get("outros_gastos"),
         tempo_horas=estado.get("tempo_horas"),
         valor_hora_desejado=estado.get("valor_hora_desejado"),
-        preco_cobrado=estado.get("preco_cobrado") if preco is None else preco,
+        preco_cobrado=preco_usado,
         taxa_maquininha_pct=estado.get("taxa_maquininha_pct"),
+        custos_fixos_rateados=rateio,
     )
+    metricas["custos_fixos_mensais"] = _arred(sum((c["valor_mensal"] for c in fixos), Decimal("0")))
+    metricas["atendimentos_por_mes"] = atendimentos
+    return metricas
 
 
-def simular_novo_preco(estado_atual: dict, novo_preco: float) -> dict:
+def calcular_metricas_recorrentes(
+    custos_fixos: list[dict],
+    quantidade_clientes: float,
+    renda_desejada: Optional[float],
+    periodicidade_renda: Optional[str],
+    horas_trabalhadas: Optional[float],
+    periodicidade_horas: Optional[str],
+    valor_hora_desejado: Optional[float],
+    preco_cobrado: Optional[float],
+    periodicidade_preco: Optional[str],
+    taxa_maquininha_pct: Optional[float] = TAXA_PADRAO,
+) -> dict:
+    """
+    Cobrança recorrente (assinatura, mensalidade, aulas...). Tudo em base MENSAL.
+
+        F     = soma(custos fixos convertidos para mês)
+        Ccli  = soma(custos por cliente/mês) * clientes
+        R     = renda desejada/mês  (ou horas/mês * valor_hora_desejado)
+        C_t   = F + Ccli + R
+        Rec   = preço/mês * clientes ; V_l = Rec * (1 - taxa) ; S = V_l - C_t
+        P_min = C_t / (clientes * (1 - taxa))          (por cliente, por mês)
+        N_min = (F + R) / (preço/mês * (1 - taxa) - custo por cliente)   (arredondado p/ cima)
+
+    preco_cobrado é opcional: sem ele, calcula só o preço recomendado.
+    """
+    taxa = _dec(TAXA_PADRAO if taxa_maquininha_pct is None else taxa_maquininha_pct)
+    if not (Decimal("0") <= taxa < Decimal("1")):
+        raise ValueError("taxa_maquininha_pct deve estar entre 0 e 1 (ex: 0.05 = 5%).")
+    clientes = _dec(quantidade_clientes)
+    if clientes <= 0:
+        raise ValueError("quantidade_clientes deve ser maior que zero.")
+
+    premissas: list[str] = []
+    itens = _custos_fixos_mensais(custos_fixos)
+    for c in itens:
+        if c["periodicidade"] is None:
+            premissas.append(f"\"{c['item']}\" como gasto mensal")
+        elif c["periodicidade"] == "unico":
+            premissas.append(f"o gasto único com \"{c['item']}\" dividido em {MESES_AMORTIZACAO} meses")
+    fixos = sum((c["valor_mensal"] for c in itens if not c["por_cliente"]), Decimal("0"))
+    por_cliente = sum((c["valor_mensal"] for c in itens if c["por_cliente"]), Decimal("0"))
+
+    horas_mes = None
+    if horas_trabalhadas is not None:
+        periodo_h = periodicidade_horas or "mensal"
+        if periodicidade_horas is None:
+            premissas.append("as horas informadas como horas por mês")
+        elif periodo_h == "diario":
+            premissas.append(f"{DIAS_TRABALHO_MES} dias de trabalho por mês")
+        horas_mes = _dec(horas_trabalhadas) * FATOR_TRABALHO[periodo_h]
+
+    if renda_desejada is not None:
+        if periodicidade_renda is None:
+            premissas.append("a renda desejada como mensal")
+        renda = _dec(renda_desejada) * FATOR_TRABALHO[periodicidade_renda or "mensal"]
+        origem_renda = "renda_desejada"
+    elif horas_mes is not None and valor_hora_desejado is not None:
+        renda = horas_mes * _dec(valor_hora_desejado)
+        origem_renda = "horas_x_valor_hora"
+    else:
+        raise ValueError("Informe a renda desejada ou horas trabalhadas e valor da hora.")
+    if renda < 0:
+        raise ValueError("Valores não podem ser negativos.")
+
+    custo_clientes = por_cliente * clientes
+    custo_total = fixos + custo_clientes + renda
+    preco_minimo_mensal = custo_total / (clientes * (1 - taxa))
+
+    fator_preco = FATOR_MENSAL[periodicidade_preco or "mensal"]
+    if preco_cobrado is not None and periodicidade_preco is None:
+        premissas.append("o preço informado como mensal")
+
+    resultado = {
+        "modelo_cobranca": "recorrente",
+        "custos_fixos": [
+            {
+                "item": c["item"],
+                "valor": _arred(c["valor"]),
+                "periodicidade": c["periodicidade"],
+                "por_cliente": c["por_cliente"],
+                "valor_mensal": _arred(c["valor_mensal"]),
+            }
+            for c in itens
+        ],
+        "custos_fixos_mensais": _arred(fixos),
+        "custo_por_cliente_mensal": _arred(por_cliente),
+        "custo_clientes_mensal": _arred(custo_clientes),
+        "renda_desejada_mensal": _arred(renda),
+        "origem_renda": origem_renda,
+        "horas_mensais": _arred(horas_mes) if horas_mes is not None else None,
+        "valor_hora_implicito": _arred(renda / horas_mes) if horas_mes else None,
+        "custo_total": _arred(custo_total),
+        "quantidade_clientes": float(clientes),
+        "taxa_maquininha_pct": float(taxa),
+        "periodicidade_preco": periodicidade_preco or "mensal",
+        "preco_minimo": _arred(preco_minimo_mensal),
+        "preco_minimo_periodo": _arred(preco_minimo_mensal / fator_preco),
+        "preco_cobrado": None,
+        "preco_mensal_por_cliente": None,
+        "receita_bruta": None,
+        "valor_taxa": None,
+        "valor_liquido": None,
+        "sobra_liquida": None,
+        "margem_pct": None,
+        "clientes_necessarios": None,
+        "cobre_custos": None,
+        "premissas": premissas,
+    }
+
+    if preco_cobrado is not None:
+        preco = _dec(preco_cobrado)
+        if preco < 0:
+            raise ValueError("Valores não podem ser negativos.")
+        preco_mensal = preco * fator_preco
+        receita = preco_mensal * clientes
+        valor_taxa = receita * taxa
+        liquido = receita - valor_taxa
+        sobra = liquido - custo_total
+        contribuicao = preco_mensal * (1 - taxa) - por_cliente
+        necessarios = (
+            int(math.ceil((fixos + renda) / contribuicao)) if contribuicao > 0 else None
+        )
+        resultado.update({
+            "preco_cobrado": _arred(preco),
+            "preco_mensal_por_cliente": _arred(preco_mensal),
+            "receita_bruta": _arred(receita),
+            "valor_taxa": _arred(valor_taxa),
+            "valor_liquido": _arred(liquido),
+            "sobra_liquida": _arred(sobra),
+            "margem_pct": _arred(sobra / receita * 100) if receita > 0 else None,
+            "clientes_necessarios": necessarios,
+            "cobre_custos": sobra >= 0,
+        })
+    return resultado
+
+
+def simular_novo_preco(
+    estado_atual: dict, novo_preco: Optional[float], novos_clientes: Optional[float] = None
+) -> dict:
     """
     Recalcula as métricas financeiras mantendo os custos do estado atual,
     porém alterando o preço cobrado para o 'novo_preco'.
     Retorna a diferença de sobra líquida entre o preço original e o simulado.
-    Se o estado não tiver preço original, "metricas_original" e
-    "diferenca_sobra" vêm como None.
+    No modelo recorrente também aceita 'novos_clientes' (ex.: "e se eu tiver 20 assinantes?").
+    Sem preço original (ou sem preço nenhum, no recorrente), as comparações vêm como None.
     """
-    if novo_preco is None or novo_preco <= 0:
+    recorrente = _modo(estado_atual) == "recorrente"
+    if novo_preco is not None and novo_preco <= 0:
+        raise ValueError("novo_preco deve ser maior que zero.")
+    if novo_preco is None and not (recorrente and novos_clientes):
         raise ValueError("novo_preco deve ser maior que zero.")
 
-    simuladas = _metricas_do_estado(estado_atual, preco=novo_preco)
+    simuladas = _metricas_do_estado(estado_atual, preco=novo_preco, clientes=novos_clientes)
     original = None
     diferenca = None
-    if estado_atual.get("preco_cobrado") is not None:
+    tem_original = estado_atual.get("preco_cobrado") is not None or recorrente
+    if tem_original:
         original = _metricas_do_estado(estado_atual)
-        diferenca = _arred(_dec(simuladas["sobra_liquida"]) - _dec(original["sobra_liquida"]))
+        if original["sobra_liquida"] is not None and simuladas["sobra_liquida"] is not None:
+            diferenca = _arred(_dec(simuladas["sobra_liquida"]) - _dec(original["sobra_liquida"]))
 
     return {
+        "modelo_cobranca": "recorrente" if recorrente else "por_servico",
         "preco_original": original["preco_cobrado"] if original else None,
         "preco_simulado": simuladas["preco_cobrado"],
+        "clientes_original": original.get("quantidade_clientes") if original else None,
+        "clientes_simulado": simuladas.get("quantidade_clientes"),
         "sobra_original": original["sobra_liquida"] if original else None,
         "sobra_simulada": simuladas["sobra_liquida"],
         "diferenca_sobra": diferenca,
@@ -529,9 +847,15 @@ def atualizar_estado(estado_anterior: dict, dados_novos: dict) -> dict:
     estado = copy.deepcopy(ESTADO_VAZIO)
     estado.update(copy.deepcopy(estado_anterior or {}))
     estado["materiais"] = list(estado.get("materiais") or [])
+    estado["custos_fixos"] = list(estado.get("custos_fixos") or [])
     intencao = dados_novos.get("intencao")
 
-    campos_simples = [c for c in ESTADO_VAZIO if c != "materiais"]
+    # Modelo de cobrança: só passa a "recorrente"; "por_servico" só define se ainda não houver
+    modelo = dados_novos.get("modelo_cobranca")
+    if modelo == "recorrente" or (modelo == "por_servico" and estado.get("modelo_cobranca") is None):
+        estado["modelo_cobranca"] = modelo
+
+    campos_simples = [c for c in ESTADO_VAZIO if c not in ("materiais", "custos_fixos", "modelo_cobranca")]
     for campo in campos_simples:
         valor = dados_novos.get(campo)
         if valor is None:
@@ -548,11 +872,34 @@ def atualizar_estado(estado_anterior: dict, dados_novos: dict) -> dict:
         else:  # mantém o nome original, atualiza o valor
             estado["materiais"][indice] = {"item": estado["materiais"][indice]["item"], "valor": novo["valor"]}
 
+    for novo in dados_novos.get("custos_fixos") or []:
+        indice = _encontrar_material(estado["custos_fixos"], novo["item"], aproximado)
+        if indice is None:
+            estado["custos_fixos"].append(dict(novo))
+        else:
+            atual = estado["custos_fixos"][indice]
+            estado["custos_fixos"][indice] = {
+                "item": atual["item"],
+                "valor": novo["valor"],
+                "periodicidade": novo.get("periodicidade") or atual.get("periodicidade"),
+                "por_cliente": novo.get("por_cliente", atual.get("por_cliente", False)),
+            }
+
     return estado
 
 
 def campos_faltantes(estado: dict) -> list[str]:
-    """Campos obrigatórios ainda não informados na sessão."""
+    """Campos obrigatórios ainda não informados na sessão (dependem do modelo de cobrança)."""
+    if _modo(estado) == "recorrente":
+        faltantes = []
+        if not estado.get("quantidade_clientes"):
+            faltantes.append("quantidade_clientes")
+        tem_meta = estado.get("renda_desejada") is not None or (
+            estado.get("horas_trabalhadas") is not None and estado.get("valor_hora_desejado") is not None
+        )
+        if not tem_meta:
+            faltantes.append("renda_desejada")
+        return faltantes
     return [c for c in CAMPOS_OBRIGATORIOS if estado.get(c) is None]
 
 
@@ -591,6 +938,13 @@ def _texto_resumo(m: dict) -> str:
         f"- **Custos diretos (materiais + deslocamento + outros):** {formatar_moeda(m['custo_direto'])}",
         f"- **Sua mão de obra ({_fmt_num(m['tempo_horas'])}h a R$ {_fmt_num(m['valor_hora_desejado'])}/h):** "
         f"{formatar_moeda(m['custo_mao_obra'])}",
+    ]
+    if m.get("custos_fixos_rateados"):
+        linhas.append(
+            f"- **Custos fixos rateados ({formatar_moeda(m['custos_fixos_mensais'])}/mês ÷ "
+            f"{_fmt_num(m['atendimentos_por_mes'])} atendimentos):** {formatar_moeda(m['custos_fixos_rateados'])}"
+        )
+    linhas += [
         f"- **Custo total do serviço:** {formatar_moeda(m['custo_total'])}",
         "",
         f"Para o preço cobrado de **{formatar_moeda(m['preco_cobrado'])}** ({taxa_txt}):",
@@ -614,6 +968,12 @@ def _texto_resumo(m: dict) -> str:
         linhas.append("")
         linhas.append(
             f"💡 **Cobre pelo menos {formatar_moeda(m['preco_minimo'])}** para não ter prejuízo."
+        )
+    if m.get("custos_fixos_mensais") and not m.get("custos_fixos_rateados"):
+        linhas.append("")
+        linhas.append(
+            f"ℹ️ Anotei seus custos fixos de {formatar_moeda(m['custos_fixos_mensais'])} por mês, mas eles ainda "
+            "não entraram na conta. Me diga quantos atendimentos você faz por mês para incluí-los."
         )
     linhas.append("")
     linhas.append(
@@ -661,6 +1021,119 @@ def _texto_simulacao(s: dict) -> str:
     return "\n".join(linhas)
 
 
+def _preco_periodo(valor: float, periodo: str) -> str:
+    return f"{formatar_moeda(valor)} {NOME_PERIODO.get(periodo, 'por mês')}"
+
+
+def _texto_resumo_recorrente(m: dict) -> str:
+    nome = m.get("nome_servico")
+    periodo = m["periodicidade_preco"]
+    clientes = _fmt_num(m["quantidade_clientes"])
+    linhas = [
+        f"Resumo do seu negócio recorrente (**{nome}**):" if nome else "Resumo do seu negócio recorrente:",
+        "",
+        "Custos por mês:",
+    ]
+    for c in m["custos_fixos"]:
+        origem = ""
+        if c["periodicidade"] not in (None, "mensal"):
+            origem = f" ({formatar_moeda(c['valor'])} {NOME_PERIODO[c['periodicidade']]})"
+        sufixo = f" por cliente × {clientes}" if c["por_cliente"] else ""
+        linhas.append(f"- {c['item']}: {formatar_moeda(c['valor_mensal'])}{sufixo}{origem}")
+    if len(m["custos_fixos"]) > 1:
+        total_custos = m["custos_fixos_mensais"] + m["custo_clientes_mensal"]
+        linhas.append(f"- **Total de custos:** {formatar_moeda(total_custos)}")
+    renda_txt = f"- **Sua renda desejada:** {formatar_moeda(m['renda_desejada_mensal'])}"
+    if m["horas_mensais"]:
+        renda_txt += (
+            f" (≈ {_fmt_num(m['horas_mensais'])}h de trabalho, "
+            f"{formatar_moeda(m['valor_hora_implicito'])} por hora)"
+        )
+    linhas += [
+        renda_txt,
+        f"- **Custo total mensal:** {formatar_moeda(m['custo_total'])}",
+        "",
+    ]
+    taxa_txt = (
+        f"{_fmt_num(m['taxa_maquininha_pct'] * 100)}% de taxa de pagamento"
+        if m["taxa_maquininha_pct"] > 0 else "sem taxa de pagamento"
+    )
+    if m["preco_cobrado"] is not None:
+        linhas.append(
+            f"Hoje: {clientes} clientes × {_preco_periodo(m['preco_cobrado'], periodo)} = "
+            f"**{formatar_moeda(m['receita_bruta'])} por mês** "
+            f"({formatar_moeda(m['valor_liquido'])} líquido, com {taxa_txt})"
+        )
+        if m["cobre_custos"]:
+            linhas.append(
+                f"- **Sobra mensal:** {formatar_moeda(m['sobra_liquida'])} além da sua renda "
+                f"(margem de {_fmt_pct(m['margem_pct'])})"
+            )
+        else:
+            linhas.append(
+                f"- ⚠️ **Faltam {formatar_moeda(abs(m['sobra_liquida']))} por mês** "
+                "para cobrir os custos e a renda que você quer."
+            )
+        linhas.append("")
+    recomendado = f"💡 **Preço mínimo recomendado:** {_preco_periodo(m['preco_minimo_periodo'], periodo)} por cliente"
+    if periodo != "mensal":
+        recomendado += f" (equivale a {formatar_moeda(m['preco_minimo'])} por mês)"
+    recomendado += f", com {clientes} clientes e {taxa_txt}."
+    linhas.append(recomendado)
+    if m["clientes_necessarios"] is not None and not m["cobre_custos"]:
+        linhas.append(
+            f"Ou, mantendo {_preco_periodo(m['preco_cobrado'], periodo)}, você precisaria de "
+            f"**{m['clientes_necessarios']} clientes**."
+        )
+    elif m["preco_cobrado"] is not None and m["clientes_necessarios"] is None and not m["cobre_custos"]:
+        linhas.append("Nesse preço, cada novo cliente não cobre nem o próprio custo: o preço precisa subir.")
+    if m["premissas"]:
+        linhas += ["", "ℹ️ Para essa conta, considerei: " + "; ".join(m["premissas"]) + ". Se algo estiver diferente, é só me corrigir."]
+    sugestao = int(math.ceil(m["preco_minimo_periodo"] / 10) * 10)
+    mais_clientes = int(math.ceil(m["quantidade_clientes"] * 1.5))
+    linhas += ["", f"Quer testar? Pergunte: 'E se eu cobrar R$ {sugestao}?' ou 'E se eu tiver {mais_clientes} clientes?'"]
+    return "\n".join(linhas)
+
+
+def _texto_simulacao_recorrente(s: dict) -> str:
+    sim, orig = s["metricas_simuladas"], s["metricas_original"]
+    periodo = sim["periodicidade_preco"]
+    clientes_sim = _fmt_num(sim["quantidade_clientes"])
+    linhas = []
+    if sim["preco_cobrado"] is not None:
+        cabecalho = f"🔎 Simulação: {clientes_sim} clientes × **{_preco_periodo(sim['preco_cobrado'], periodo)}**"
+        if orig and orig["preco_cobrado"] is not None:
+            cabecalho += (
+                f" (hoje: {_fmt_num(orig['quantidade_clientes'])} × "
+                f"{_preco_periodo(orig['preco_cobrado'], periodo)})"
+            )
+        linhas += [
+            cabecalho,
+            f"- Receita líquida: **{formatar_moeda(sim['valor_liquido'])} por mês**"
+            + (f" (antes {formatar_moeda(orig['valor_liquido'])})" if orig and orig["valor_liquido"] is not None else ""),
+        ]
+        sobra_txt = f"- Sobra mensal: **{formatar_moeda(sim['sobra_liquida'])}**"
+        dif = s["diferenca_sobra"]
+        if dif is not None:
+            sobra_txt += f" (antes {formatar_moeda(orig['sobra_liquida'])})"
+            if dif:
+                sobra_txt += f" → {formatar_moeda(abs(dif))} {'a mais' if dif > 0 else 'a menos'} por mês"
+        linhas.append(sobra_txt)
+        if not sim["cobre_custos"]:
+            linhas.append("- ⚠️ Ainda não cobre os custos e a renda que você quer.")
+    else:
+        linhas.append(f"🔎 Simulação com **{clientes_sim} clientes**:")
+    linhas.append("")
+    minimo = f"💡 Preço mínimo com {clientes_sim} clientes: **{_preco_periodo(sim['preco_minimo_periodo'], periodo)}**"
+    if orig and orig["quantidade_clientes"] != sim["quantidade_clientes"]:
+        minimo += (
+            f" (com {_fmt_num(orig['quantidade_clientes'])}: "
+            f"{_preco_periodo(orig['preco_minimo_periodo'], periodo)})"
+        )
+    linhas.append(minimo + ".")
+    return "\n".join(linhas)
+
+
 def formatar_explicacao_humana(metricas: dict, intencao: str) -> str:
     """
     Converte os números calculados em texto simples.
@@ -668,9 +1141,10 @@ def formatar_explicacao_humana(metricas: dict, intencao: str) -> str:
         (opcionalmente com "nome_servico").
       - simular_preco: recebe o dict de simular_novo_preco.
     """
+    recorrente = metricas.get("modelo_cobranca") == "recorrente"
     if intencao == "simular_preco":
-        return _texto_simulacao(metricas)
-    resumo = _texto_resumo(metricas)
+        return _texto_simulacao_recorrente(metricas) if recorrente else _texto_simulacao(metricas)
+    resumo = _texto_resumo_recorrente(metricas) if recorrente else _texto_resumo(metricas)
     if intencao == "corrigir_dado":
         return "✅ Pronto, dado corrigido! Veja como ficou:\n\n" + resumo
     return resumo
@@ -678,7 +1152,7 @@ def formatar_explicacao_humana(metricas: dict, intencao: str) -> str:
 
 def _texto_faltantes(faltantes: list[str], intencao: str) -> str:
     inicio = "✅ Anotado!" if intencao == "corrigir_dado" else "Anotei!"
-    itens = "\n".join(f"- {CAMPOS_OBRIGATORIOS[c]}" for c in faltantes)
+    itens = "\n".join(f"- {DESCRICOES_FALTANTES[c]}" for c in faltantes)
     return f"{inicio} Para calcular seu preço justo, ainda preciso saber:\n{itens}"
 
 
@@ -749,14 +1223,15 @@ def processar_mensagem_usuario(
         faltantes = campos_faltantes(novo_estado)
         if intencao == "simular_preco":
             novo_preco = dados.get("novo_preco_simulado")
+            novos_clientes = dados.get("novo_quantidade_clientes") if _modo(novo_estado) == "recorrente" else None
             faltantes_sim = [c for c in faltantes if c != "preco_cobrado"]
             resultado["informacoes_faltantes"] = faltantes_sim
-            if not novo_preco:
+            if not novo_preco and not novos_clientes:
                 resultado["resposta"] = "Qual valor você quer testar? Ex: 'E se eu cobrar R$ 90?'"
             elif faltantes_sim:
                 resultado["resposta"] = _texto_faltantes(faltantes_sim, intencao)
             else:
-                simulacao = simular_novo_preco(novo_estado, novo_preco)
+                simulacao = simular_novo_preco(novo_estado, novo_preco, novos_clientes)
                 resultado["simulacao"] = simulacao
                 resultado["resposta"] = formatar_explicacao_humana(simulacao, intencao)
         else:
