@@ -1,0 +1,103 @@
+
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <script src="/static/chat.js" defer></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Precifica.AI</title>
+
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+
+    <main class="chat-container">
+
+        <!-- Cabeçalho do chatbot -->
+        <header class="chat-header">
+
+            <div class="perfil">
+
+                <div class="avatar">
+                    PA
+                </div>
+
+                <div class="perfil-info">
+                    <h1>Precifica.AI</h1>
+                    <p>
+                        <span class="status-online"></span>
+                        Assistente de precificação
+                    </p>
+                </div>
+
+            </div>
+
+            <button type="button" id="novo-servico">
+                Nova conversa
+            </button>
+
+        </header>
+
+        <!-- Área das mensagens -->
+        <section
+            id="mensagens"
+            role="log"
+            aria-label="Mensagens da conversa"
+            aria-live="polite"
+            aria-relevant="additions"
+        >
+
+            <div class="mensagem bot">
+                <p>Olá! 👋 Seja bem-vinda ao <strong>Precifica.AI!</strong></p>
+
+                <p>
+                    Vou te ajudar a entender seus custos
+                    e descobrir quanto realmente sobra
+                    do seu trabalho.
+                </p>
+
+                <p>
+                    Para começarmos, qual serviço você
+                    oferece e quanto cobra atualmente?
+                </p>
+            </div>
+
+        </section>
+
+        <!-- Área de digitação -->
+        <footer class="chat-footer">
+
+            <form id="form-chat">
+
+                <label for="campo-mensagem" class="sr-only">
+                    Sua mensagem
+                </label>
+
+                <input
+                    type="text"
+                    id="campo-mensagem"
+                    name="mensagem"
+                    placeholder="Digite sua mensagem..."
+                    autocomplete="off"
+                    required
+                >
+
+                <button type="submit" id="btn-enviar">
+                    Enviar
+                    <span aria-hidden="true">➤</span>
+                </button>
+
+            </form>
+
+            <p class="aviso">
+                Precifica.AI • Precificação inteligente
+            </p>
+
+        </footer>
+
+    </main>
+
+</body>
+</html>
