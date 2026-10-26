@@ -20,6 +20,8 @@ from unittest import mock
 import engine
 
 logging.getLogger("preco_justo.engine").setLevel(logging.CRITICAL)  # saída limpa
+# A maioria dos testes calcula direto; a etapa de confirmação tem testes próprios.
+engine.PEDIR_CONFIRMACAO = False
 from engine import (
     atualizar_estado,
     calcular_metricas_financeiras,
@@ -29,6 +31,11 @@ from engine import (
     processar_mensagem_usuario,
     simular_novo_preco,
 )
+
+
+def iv(lista):
+    """Só item e valor de uma lista de materiais/custos (ignora atributos extras)."""
+    return [{"item": x["item"], "valor": x["valor"]} for x in lista]
 
 
 def resposta_llm(**campos):
@@ -120,7 +127,7 @@ class TestCenario2CosturaCorrecao(unittest.TestCase):
         "tempo_horas": 3.0,
         "valor_hora_desejado": 25.0,
         "materiais": [{"item": "Tecido", "valor": 20.0}, {"item": "Linha e zíper", "valor": 8.0}],
-        "deslocamento": None,
+        "deslocamento": 0.0,
         "outros_gastos": None,
         "taxa_maquininha_pct": 0.05,
     }
@@ -145,11 +152,11 @@ class TestCenario2CosturaCorrecao(unittest.TestCase):
     def test_tecido_atualizado_para_35(self):
         materiais = self.r["estado"]["materiais"]
         self.assertEqual(len(materiais), 2)  # não duplicou o tecido
-        self.assertEqual(materiais[0], {"item": "Tecido", "valor": 35.0})
+        self.assertEqual(iv(materiais)[0], {"item": "Tecido", "valor": 35.0})
 
     def test_restante_preservado(self):
         e = self.r["estado"]
-        self.assertEqual(e["materiais"][1], {"item": "Linha e zíper", "valor": 8.0})
+        self.assertEqual(iv(e["materiais"])[1], {"item": "Linha e zíper", "valor": 8.0})
         self.assertEqual(e["preco_cobrado"], 150.0)
         self.assertEqual(e["tempo_horas"], 3.0)
         self.assertEqual(e["valor_hora_desejado"], 25.0)
@@ -174,7 +181,7 @@ class TestCenario3ArtesanatoSimulacao(unittest.TestCase):
         "tempo_horas": 2.0,
         "valor_hora_desejado": 10.0,
         "materiais": [{"item": "MDF", "valor": 12.0}, {"item": "Tinta", "valor": 8.0}],
-        "deslocamento": None,
+        "deslocamento": 0.0,
         "outros_gastos": None,
         "taxa_maquininha_pct": 0.05,
     }
@@ -204,8 +211,11 @@ class TestCenario3ArtesanatoSimulacao(unittest.TestCase):
         self.assertEqual(self.r["estado"]["preco_cobrado"], 60.0)
 
     def test_resposta_comparativa(self):
-        self.assertIn("R$ 28,50 a mais", self.r["resposta"])
-        self.assertIn("antes R$ 17,00", self.r["resposta"])
+        s = self.r["simulacao"]
+        self.assertEqual(s["sobra_real_original"], 37.00)   # 57 - 20 (sem descontar a meta)
+        self.assertEqual(s["sobra_real_simulada"], 65.50)   # 85,50 - 20
+        self.assertIn("R$ 37,00 → **R$ 65,50**", self.r["resposta"])
+        self.assertIn("O preço sobe 50,0%", self.r["resposta"])
 
 
 # --------------------------------------------------------------------------- #
@@ -224,12 +234,14 @@ class TestMotorFinanceiro(unittest.TestCase):
         self.assertEqual(m["custo_total"], 65.00)
         self.assertEqual(m["valor_liquido"], 114.00)
         self.assertEqual(m["sobra_liquida"], 49.00)
-        self.assertEqual(m["margem_pct"], 40.83)
+        self.assertEqual(m["margem_pct"], 65.83)  # sobra real (79) / preço (120)
         self.assertEqual(m["preco_minimo"], 68.42)
 
+        self.assertEqual(m["sobra_real"], 79.00)        # 120 - 35 - 6 (sem descontar a meta)
+        self.assertEqual(m["valor_hora_real"], 52.67)   # 79 / 1,5
         texto = formatar_explicacao_humana({**m, "nome_servico": "Maquiagem Social"}, "informar_dados")
-        self.assertIn("1,5h a R$ 20/h", texto)
-        self.assertIn("margem de 40,8%", texto)
+        self.assertIn("**Valor por hora:** R$ 52,67", texto)
+        self.assertIn("Acima da sua meta de R$ 20/h", texto)
         self.assertIn("R$ 68,42", texto)
 
     def test_sem_taxa(self):
@@ -300,7 +312,7 @@ class TestNormalizacao(unittest.TestCase):
 
     def test_materiais_invalidos_descartados(self):
         d = normalizar_extracao(resposta_llm(materiais=[{"item": "gel", "valor": "15"}, {"item": "", "valor": 3}, "x"]))
-        self.assertEqual(d["materiais"], [{"item": "gel", "valor": 15.0}])
+        self.assertEqual(iv(d["materiais"]), [{"item": "gel", "valor": 15.0}])
 
     def test_json_com_cercas_markdown(self):
         self.assertEqual(engine._extrair_json('```json\n{"intencao": "informar_dados"}\n```'),
@@ -315,14 +327,14 @@ class TestAtualizarEstado(unittest.TestCase):
             {"materiais": [{"item": "Gel", "valor": 10}]},
             normalizar_extracao(resposta_llm(materiais=[{"item": "gel", "valor": 12}, {"item": "Lixa", "valor": 3}])),
         )
-        self.assertEqual(e["materiais"], [{"item": "Gel", "valor": 12.0}, {"item": "Lixa", "valor": 3.0}])
+        self.assertEqual(iv(e["materiais"]), [{"item": "Gel", "valor": 12.0}, {"item": "Lixa", "valor": 3.0}])
 
     def test_correcao_por_nome_aproximado(self):
         e = atualizar_estado(
             {"materiais": [{"item": "Tecido de algodão", "valor": 20}]},
             normalizar_extracao(resposta_llm(intencao="corrigir_dado", materiais=[{"item": "tecido", "valor": 35}])),
         )
-        self.assertEqual(e["materiais"], [{"item": "Tecido de algodão", "valor": 35.0}])
+        self.assertEqual(iv(e["materiais"]), [{"item": "Tecido de algodão", "valor": 35.0}])
 
     def test_none_nao_apaga_dados(self):
         e = atualizar_estado({"tempo_horas": 2.0}, normalizar_extracao(resposta_llm(preco_cobrado=50)))
@@ -339,6 +351,7 @@ class TestAtualizarEstado(unittest.TestCase):
 
 # --------------------------------------------------------------------------- #
 # Robustez do contrato com o front-end
+# --------------------------------------------------------------------------- #
 
 class TestRobustez(unittest.TestCase):
     CHAVES = {"sucesso", "intencao", "dados_extraidos", "estado", "metricas",
@@ -353,10 +366,11 @@ class TestRobustez(unittest.TestCase):
         self.assertTrue(r["resposta"])
 
     def test_estado_malformado_do_navegador_nao_gera_erro_500(self):
+        ok = {"materiais": [{"item": "x", "valor": 1}], "deslocamento": 0}
         ruins = [
-            {"preco_cobrado": 60, "tempo_horas": "abc", "valor_hora_desejado": 10},
-            {"preco_cobrado": 60, "tempo_horas": 1, "valor_hora_desejado": 10, "materiais": "tecido"},
-            {"preco_cobrado": 60, "tempo_horas": 1, "valor_hora_desejado": 10, "materiais": [{"item": "x", "valor": "abc"}]},
+            {**ok, "preco_cobrado": 60, "tempo_horas": "abc"},
+            {**ok, "preco_cobrado": 60, "tempo_horas": 1, "materiais": "tecido"},
+            {**ok, "preco_cobrado": 60, "tempo_horas": 1, "materiais": [{"item": "x", "valor": "abc"}]},
         ]
         for estado in ruins:
             r = processar_mensagem_usuario("Cobro 60", estado,
@@ -376,7 +390,7 @@ class TestRobustez(unittest.TestCase):
         r = processar_mensagem_usuario("Cobro 80 na escova",
                                        extrator=FakeExtrator(resposta_llm(preco_cobrado=80)))
         self.assertTrue(r["sucesso"])
-        self.assertEqual(r["informacoes_faltantes"], ["tempo_horas", "valor_hora_desejado"])
+        self.assertEqual(r["informacoes_faltantes"], ["tempo_horas", "materiais", "deslocamento"])
         self.assertIsNone(r["metricas"])
         self.assertIn("quanto tempo leva", r["resposta"])
 
@@ -388,15 +402,16 @@ class TestRobustez(unittest.TestCase):
         self.assertIn("tempo_horas", r["informacoes_faltantes"])
 
     def test_fluxo_completo_em_varias_mensagens(self):
-        r1 = processar_mensagem_usuario("Cobro 100 no corte", extrator=FakeExtrator(
-            resposta_llm(preco_cobrado=100, nome_servico="Corte")))
+        r1 = processar_mensagem_usuario("Cobro 100 no corte, sem material e sem deslocamento", extrator=FakeExtrator(
+            resposta_llm(preco_cobrado=100, nome_servico="Corte", deslocamento=0,
+                         materiais=[{"item": "Nenhum", "valor": 0}])))
         r2 = processar_mensagem_usuario("Levo 1h e quero 40/h", r1["estado"], extrator=FakeExtrator(
             resposta_llm(tempo_horas=1, valor_hora_desejado=40)))
         self.assertEqual(r2["metricas"]["sobra_liquida"], 55.00)  # 95 - 40
         r3 = processar_mensagem_usuario("E se eu cobrar 80?", r2["estado"], extrator=FakeExtrator(
             resposta_llm(intencao="simular_preco", novo_preco_simulado=80)))
         self.assertEqual(r3["simulacao"]["diferenca_sobra"], -19.00)
-        self.assertIn("a menos", r3["resposta"])
+        self.assertIn("O preço cai 20,0%", r3["resposta"])
 
     def test_contexto_do_estado_enviado_para_ia(self):
         conteudo = engine._montar_conteudo("o tecido foi 35", {"materiais": [{"item": "Tecido", "valor": 20}]})
@@ -586,7 +601,8 @@ class TestCenarioRecorrenteAssinatura(unittest.TestCase):
     def test_preco_anual(self):
         r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(
             modelo_cobranca="recorrente", quantidade_clientes=10, preco_cobrado=1200,
-            periodicidade_preco="anual", renda_desejada=2000, periodicidade_renda="mensal")))
+            periodicidade_preco="anual", renda_desejada=2000, periodicidade_renda="mensal",
+            custos_fixos=[{"item": "Nenhum", "valor": 0, "periodicidade": "mensal"}])))
         m = r["metricas"]
         self.assertEqual(m["receita_bruta"], 1000.00)          # 10 x 1200 / 12
         self.assertEqual(m["preco_minimo"], 210.53)            # por mês
@@ -597,7 +613,8 @@ class TestCenarioRecorrenteAssinatura(unittest.TestCase):
         r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(
             modelo_cobranca="recorrente", quantidade_clientes=20, renda_desejada=3000,
             periodicidade_renda="mensal",
-            custos_fixos=[{"item": "Servidor", "valor": 5, "periodicidade": "mensal", "por_cliente": True}])))
+            custos_fixos=[{"item": "Servidor", "valor": 5, "periodicidade": "mensal", "por_cliente": True},
+                          {"item": "Nenhum", "valor": 0, "periodicidade": "mensal"}])))
         m = r["metricas"]
         self.assertIsNone(m["sobra_liquida"])
         self.assertEqual(m["custo_total"], 3100.00)   # 5 x 20 + 3000
@@ -606,14 +623,16 @@ class TestCenarioRecorrenteAssinatura(unittest.TestCase):
     def test_renda_por_horas_e_valor_hora(self):
         r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(
             modelo_cobranca="recorrente", quantidade_clientes=8, horas_trabalhadas=20,
-            periodicidade_horas="semanal", valor_hora_desejado=50)))
+            periodicidade_horas="semanal", valor_hora_desejado=50,
+            custos_fixos=[{"item": "Nenhum", "valor": 0, "periodicidade": "mensal"}])))
         self.assertEqual(r["metricas"]["origem_renda"], "horas_x_valor_hora")
         self.assertEqual(r["metricas"]["renda_desejada_mensal"], 4333.33)  # 20h x 52/12 x 50
 
     def test_pede_o_que_falta_no_recorrente(self):
         r = processar_mensagem_usuario("Tenho alunos de inglês", extrator=FakeExtrator(resposta_llm(
             modelo_cobranca="recorrente", preco_cobrado=300, periodicidade_preco="mensal")))
-        self.assertEqual(r["informacoes_faltantes"], ["quantidade_clientes", "renda_desejada"])
+        self.assertEqual(r["informacoes_faltantes"], ["quantidade_clientes", "custos_fixos"])
+        self.assertIn("todo mês", r["resposta"])
         self.assertIn("quantos clientes ou assinantes", r["resposta"])
 
     def test_modelo_inferido_sem_classificacao_da_ia(self):
@@ -659,8 +678,111 @@ class TestPorServicoComCustosFixos(unittest.TestCase):
         self.assertIn("quantos atendimentos você faz por mês", r["resposta"])
 
 
+# --------------------------------------------------------------------------- #
+# Comportamentos pedidos pelo gabarito de 5 cenários (preco_justo_5_casos.pdf)
+# --------------------------------------------------------------------------- #
 
-# Integração real com o Gemini
+class TestCasosGabarito(unittest.TestCase):
+    """Roda os 5 cenários do avaliar_casos.py em modo offline: nenhuma verificação pode falhar."""
+
+    def test_cinco_cenarios_offline(self):
+        import avaliar_casos
+        with mock.patch.object(engine, "PEDIR_CONFIRMACAO", True):
+            for funcao in (avaliar_casos.cenario_1, avaliar_casos.cenario_2, avaliar_casos.cenario_3,
+                           avaliar_casos.cenario_4, avaliar_casos.cenario_5):
+                cenario = funcao(False)
+                falhas = [i["verificacao"] for i in cenario.itens if i["ok"] is False]
+                self.assertEqual(falhas, [], cenario.nome)
+
+
+class TestConfirmacao(unittest.TestCase):
+    COMPLETO = resposta_llm(preco_cobrado=150, tempo_horas=2.5, deslocamento=24, taxa_maquininha_pct=0.035,
+                            materiais=[{"item": "Produtos", "valor": 21.5}])
+
+    def setUp(self):
+        patcher = mock.patch.object(engine, "PEDIR_CONFIRMACAO", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.r = processar_mensagem_usuario("dados completos", extrator=FakeExtrator(self.COMPLETO))
+
+    def test_mostra_resumo_e_nao_calcula(self):
+        self.assertIsNone(self.r["metricas"])
+        self.assertTrue(self.r["estado"]["aguardando_confirmacao"])
+        self.assertIn("Confira os dados", self.r["resposta"])
+        self.assertIn("Está tudo certo?", self.r["resposta"])
+
+    def test_sim_calcula_sem_chamar_a_ia(self):
+        extrator = FakeExtrator(engine.ErroExtracao("não deveria ser chamado"))
+        r = processar_mensagem_usuario("Sim, pode calcular!", self.r["estado"], extrator=extrator)
+        self.assertEqual(extrator.chamadas, [])
+        self.assertEqual(r["metricas"]["sobra_real"], 99.25)
+        self.assertTrue(r["estado"]["confirmado"])
+
+    def test_sim_com_correcao_passa_pela_ia(self):
+        extrator = FakeExtrator(resposta_llm(intencao="corrigir_dado", deslocamento=30))
+        r = processar_mensagem_usuario("sim, mas o deslocamento é 30", self.r["estado"], extrator=extrator)
+        self.assertEqual(len(extrator.chamadas), 1)
+        self.assertIsNone(r["metricas"])                      # mostra o resumo de novo
+        self.assertIn("Deslocamento: R$ 30,00", r["resposta"])
+
+    def test_depois_de_confirmar_correcao_recalcula_direto(self):
+        r = processar_mensagem_usuario("sim", self.r["estado"])
+        r = processar_mensagem_usuario("o deslocamento foi 30", r["estado"], extrator=FakeExtrator(
+            resposta_llm(intencao="corrigir_dado", deslocamento=30)))
+        self.assertEqual(r["metricas"]["sobra_real"], 93.25)
+
+
+class TestValidacoesDoGabarito(unittest.TestCase):
+    def rodar(self, **campos):
+        return processar_mensagem_usuario("x", {"preco_cobrado": 100}, extrator=FakeExtrator(resposta_llm(**campos)))
+
+    def test_negativo_nao_e_gravado_e_pergunta(self):
+        r = self.rodar(deslocamento=-30)
+        self.assertIsNone(r["estado"]["deslocamento"])
+        self.assertIn("erro de digitação", r["resposta"])
+
+    def test_tempo_zero_e_preco_zero(self):
+        r = self.rodar(tempo_horas=0)
+        self.assertIsNone(r["estado"]["tempo_horas"])
+        self.assertIn("tempo real", r["resposta"])
+        r = self.rodar(intencao="corrigir_dado", preco_cobrado=0)
+        self.assertEqual(r["estado"]["preco_cobrado"], 100)
+        self.assertIn("gratuito", r["resposta"])
+
+    def test_nao_sabe_oferece_estimativa_sem_inventar(self):
+        r = self.rodar(nao_sabe=["materiais"])
+        self.assertEqual(r["estado"]["materiais"], [])
+        self.assertIn("estimar", r["resposta"])
+
+    def test_tempo_em_partes_e_somado_em_python(self):
+        d = normalizar_extracao(resposta_llm(tempo_partes_horas=[1.5, 0.5, 0.5]))
+        self.assertEqual(d["tempo_horas"], 2.5)
+
+    def test_embalagem_sem_rendimento_bloqueia_e_pergunta(self):
+        r = self.rodar(tempo_horas=1, deslocamento=0,
+                       materiais=[{"item": "Pó compacto", "valor": 80, "embalagem": True}])
+        self.assertIn("rendimento:Pó compacto", r["informacoes_faltantes"])
+        self.assertIn('quanto rende "Pó compacto"', r["resposta"])
+
+    def test_custo_por_rendimento(self):
+        self.assertEqual(float(engine.custo_material({"valor": 25, "rendimento": 100, "quantidade_usada": 2})), 0.5)
+
+    def test_sem_meta_calcula_valor_por_hora_real(self):
+        m = engine.calcular_metricas_financeiras([{"item": "m", "valor": 21.5}], 24, 0, 2.5, None, 150, 0.035)
+        self.assertEqual(m["custos_totais"], 50.75)
+        self.assertEqual(m["sobra_real"], 99.25)
+        self.assertEqual(m["valor_hora_real"], 39.70)
+        self.assertFalse(m["tem_meta"])
+
+    def test_taxa_padrao_e_avisada(self):
+        r = processar_mensagem_usuario("x", extrator=FakeExtrator(resposta_llm(
+            preco_cobrado=100, tempo_horas=1, deslocamento=0, materiais=[{"item": "m", "valor": 10}])))
+        self.assertIn("forma de pagamento não foi informada", r["resposta"])
+
+
+# --------------------------------------------------------------------------- #
+# Integração real com o Gemini (opcional)
+# --------------------------------------------------------------------------- #
 
 @unittest.skipUnless(os.getenv("GEMINI_API_KEY") and os.getenv("RUN_INTEGRATION") == "1",
                      "Defina GEMINI_API_KEY e RUN_INTEGRATION=1 para testar com o Gemini real.")
